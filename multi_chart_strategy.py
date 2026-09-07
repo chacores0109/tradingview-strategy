@@ -18,6 +18,7 @@ import os
 import sys
 import glob
 import json
+import re
 import argparse
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -38,13 +39,67 @@ if hasattr(sys.stderr, "reconfigure"):
         pass
 
 
+def read_csv_robust(filepath: str, nrows: Optional[int] = None) -> pd.DataFrame:
+    """具备多重中文编码容错的 CSV 读取器，兼容 utf-8-sig, utf-8, gb18030, gbk。"""
+    for enc in ["utf-8-sig", "utf-8", "gb18030", "gbk"]:
+        try:
+            df = pd.read_csv(filepath, nrows=nrows, encoding=enc)
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    df = pd.read_csv(filepath, nrows=nrows, encoding="utf-8", errors="replace")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
 def parse_timestamp_to_epoch(val) -> float:
-    """将 TradingView 导出的 ISO 字符串或 Unix 时间戳转换为 float 秒数。"""
+    """将 TradingView 导出的 ISO 字符串或 Unix 时间戳转换为 float 秒数，兼容各类格式与空值。"""
+    if val is None or pd.isna(val) or val == "":
+        return np.nan
     try:
-        return float(val)
+        f = float(val)
+        if f > 1e14:
+            return f / 1e9
+        elif f > 1e11:
+            return f / 1e3
+        return f
     except (ValueError, TypeError):
-        dt = pd.to_datetime(val)
-        return dt.timestamp()
+        try:
+            dt = pd.to_datetime(val, format="mixed")
+            if pd.isna(dt):
+                return np.nan
+            return dt.timestamp()
+        except Exception:
+            return np.nan
+
+
+def parse_series_to_epoch(s: pd.Series) -> pd.Series:
+    """批量超高效时间戳序列转换（支持毫秒/纳秒自适应、ISO字符串及混合格式）。"""
+    s_num = pd.to_numeric(s, errors="coerce")
+    valid_mask = s_num.notna()
+    if valid_mask.sum() > 0 and (valid_mask.sum() >= len(s) * 0.8):
+        s_float = s_num.astype(float)
+        median_val = s_float[valid_mask].median()
+        if median_val > 1e14:      # 纳秒 (19位)
+            s_float = s_float / 1e9
+        elif median_val > 1e11:    # 毫秒 (13位)
+            s_float = s_float / 1e3
+        return s_float
+
+    try:
+        s_dt = pd.to_datetime(s, errors="coerce", utc=True, format="mixed")
+        if s_dt.notna().any():
+            s_int = s_dt.astype("int64")
+            unit = str(s_dt.dtype).split("[")[-1].split(",")[0].rstrip("]")
+            divisor = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}.get(unit, 1e9)
+            s_epoch = s_int / divisor
+            s_epoch[s_dt.isna()] = np.nan
+            return s_epoch
+    except Exception:
+        pass
+
+    return s.apply(parse_timestamp_to_epoch)
 
 
 class MultiChartDataManager:
@@ -55,41 +110,98 @@ class MultiChartDataManager:
         self.raw_dfs: Dict[str, pd.DataFrame] = {}
         self.merged_df: Optional[pd.DataFrame] = None
 
+    @staticmethod
+    def is_raw_chart_candidate(filepath: str) -> bool:
+        """过滤掉回测/对齐导出的结果文件，仅保留包含时间戳的原始图表 CSV。"""
+        basename = os.path.basename(filepath).lower()
+        exclude_kw = ["signal", "trade", "result", "aligned", "export", "summary", "log", "backtest", "optimize"]
+        if any(kw in basename for kw in exclude_kw):
+            return False
+        try:
+            head = read_csv_robust(filepath, nrows=5)
+            if head is None or head.empty or len(head.columns) < 2:
+                return False
+
+            cols = [str(c).strip() for c in head.columns]
+            cols_lower = [c.lower() for c in cols]
+
+            output_indicators = [
+                "raw_buy", "raw_sell", "renko_009_rg_close", "10m_rg_close",
+                "range_4r_rg_close", "4m_01688_rg_close", "cumulative_pnl",
+                "pnl_pct", "bars_held", "exit_type", "mfe_pct", "mae_pct"
+            ]
+            if any(col in cols for col in output_indicators):
+                return False
+
+            has_time = any(c in cols_lower for c in ["time", "timestamp", "datetime", "date_time", "date", "epoch", "时间", "日期", "成交时间"])
+            if not has_time:
+                return False
+
+            return True
+        except Exception:
+            return False
+
     def auto_detect_files(self) -> Dict[str, str]:
-        """根据文件名和特征自动匹配四张图表文件。"""
+        """根据文件名和特征自动匹配四张图表文件，隔离历史结果导出文件。"""
         csv_files = glob.glob(os.path.join(self.data_dir, "*.csv"))
+        candidates = [f for f in csv_files if self.is_raw_chart_candidate(f)]
+        if not candidates:
+            return {}
+
+        # 若存在同目录下多个标的，自动锁定文件数最多的标的前缀（如 SSE_603993）
+        ticker_counts = {}
+        for f in candidates:
+            b = os.path.basename(f)
+            if "," in b:
+                prefix = b.split(",")[0].strip()
+                ticker_counts[prefix] = ticker_counts.get(prefix, 0) + 1
+        if ticker_counts:
+            best_prefix = max(ticker_counts.items(), key=lambda x: x[1])[0]
+            prefix_candidates = [f for f in candidates if os.path.basename(f).startswith(best_prefix)]
+            if len(prefix_candidates) >= 2:
+                candidates = prefix_candidates
+
         file_map = {}
 
-        for f in csv_files:
+        # 1. 优先根据文件名模式匹配
+        for f in candidates:
             basename = os.path.basename(f)
-            # 1. 10m
-            if "10_" in basename or "10m" in basename.lower():
-                file_map["10m"] = f
-            # 2. 4R
-            elif "4R" in basename or "4r" in basename.lower():
-                file_map["range_4r"] = f
-            # 3. 2_5346c (Renko 0.09%, brick=0.02)
-            elif "2_" in basename or "0.09" in basename:
-                file_map["renko_009"] = f
-            # 4. 4_aa2e3 (Renko 0.1688%, brick=0.05)
-            elif "4_" in basename or "0.1688" in basename:
-                file_map["4m_01688"] = f
+            b_lower = basename.lower()
+            # Range 纯价格结构图：如 2R_xxx.csv, 4R_xxx.csv, 10R_xxx.csv, 或带 range
+            if re.search(r'(?:^|[\s_,])\d+r(?:$|[\s_.,])', b_lower) or "range" in b_lower:
+                if "range_4r" not in file_map:
+                    file_map["range_4r"] = f
+            # 10m 宏观普通K线
+            elif "10_" in basename or "10m" in b_lower or re.search(r'(?:^|[\s_,])10(?:$|[_.,])', basename):
+                if "10m" not in file_map:
+                    file_map["10m"] = f
+            # 0.09% 微观砖形图 (TV命名如 2_xxxx.csv，注意排除 2R)
+            elif (re.search(r'(?:^|[\s_,])2(?:$|[_.,])', basename) or "0.09" in basename) and not re.search(r'(?:^|[\s_,])\d+r', b_lower):
+                if "renko_009" not in file_map:
+                    file_map["renko_009"] = f
+            # 4m 0.1688% 动量砖形图 (TV命名如 4_xxxx.csv，注意排除 4R)
+            elif (re.search(r'(?:^|[\s_,])4(?:$|[_.,])', basename) or "0.1688" in basename or "4m" in b_lower) and not re.search(r'(?:^|[\s_,])\d+r', b_lower):
+                if "4m_01688" not in file_map:
+                    file_map["4m_01688"] = f
 
-        # 如果自动匹配缺失，按文件行数及步长备用推断
+        # 2. 如果自动匹配缺失，按指标特征内容推断
         if len(file_map) < 4:
-            for f in csv_files:
+            for f in candidates:
                 if f in file_map.values():
                     continue
-                df_temp = pd.read_csv(f, nrows=20)
-                cols_str = " ".join(df_temp.columns)
-                if "WT1" in cols_str and "4m_01688" not in file_map:
-                    file_map["4m_01688"] = f
-                elif "通道位置" in cols_str and "renko_009" not in file_map:
-                    file_map["renko_009"] = f
-                elif "反转形状" in cols_str and "range_4r" not in file_map:
-                    file_map["range_4r"] = f
-                elif "EMA" in cols_str and "10m" not in file_map:
-                    file_map["10m"] = f
+                try:
+                    df_temp = read_csv_robust(f, nrows=15)
+                    cols_str = " ".join([str(c).strip() for c in df_temp.columns])
+                    if any(k in cols_str for k in ["WT1", "WT2", "WaveTrend", "中轴线"]) and "4m_01688" not in file_map:
+                        file_map["4m_01688"] = f
+                    elif any(k in cols_str for k in ["通道位置", "需求强度", "供给强度", "成交量中心线", "成交量压力"]) and "renko_009" not in file_map:
+                        file_map["renko_009"] = f
+                    elif any(k in cols_str for k in ["反转形状", "买入形状", "卖出形状", "多头反转形状", "快速 MA", "慢速 MA"]) and "range_4r" not in file_map:
+                        file_map["range_4r"] = f
+                    elif any(k in cols_str for k in ["EMA 曲线", "Cloud Reach", "Cloud Candle", "EMA"]) and "10m" not in file_map:
+                        file_map["10m"] = f
+                except Exception:
+                    pass
 
         return file_map
 
@@ -98,37 +210,65 @@ class MultiChartDataManager:
         if file_map is None:
             file_map = self.auto_detect_files()
 
+        if not file_map:
+            raise FileNotFoundError(f"在目录 [{os.path.abspath(self.data_dir)}] 中未识别到任何有效的 TradingView 图表数据 CSV 文件！")
+
         print("--> 识别到的图表数据文件映射:")
         for k, v in file_map.items():
             print(f"    [{k:<12}] -> {os.path.basename(v)}")
 
         dfs = {}
         for key, path in file_map.items():
-            df = pd.read_csv(path)
-            df["epoch"] = df["time"].apply(parse_timestamp_to_epoch)
+            df = read_csv_robust(path)
+
+            time_col = None
+            for c in df.columns:
+                if c.strip().lower() in ["time", "timestamp", "datetime", "date_time", "date", "epoch", "时间", "日期", "成交时间"]:
+                    time_col = c
+                    break
+
+            if time_col is None:
+                raise ValueError(
+                    f"图表 [{key}] 对应文件 [{os.path.basename(path)}] 未找到有效的时间戳列 (如 time, timestamp, datetime, epoch)！"
+                    f"现有列名: {list(df.columns[:10])}"
+                )
+
+            df["epoch"] = parse_series_to_epoch(df[time_col])
+            df = df.dropna(subset=["epoch"]).sort_values("epoch").reset_index(drop=True)
             df["dt"] = (
                 pd.to_datetime(df["epoch"], unit="s", utc=True)
                 .dt.tz_convert("Asia/Shanghai")
             )
-            df = df.sort_values("epoch").reset_index(drop=True)
+
+            ohlc_map = {}
+            for col in df.columns:
+                if col.strip().lower() in ["open", "high", "low", "close", "volume"]:
+                    ohlc_map[col] = col.strip().lower()
+            if ohlc_map:
+                df = df.rename(columns=ohlc_map)
 
             # 规范化 Banker Fund 指标列名
             rename_dict = {}
             for col in df.columns:
-                if "red_green" in col:
-                    if "关" in col or "close" in col.lower():
+                col_s = col.strip()
+                if "red_green" in col_s:
+                    if "关" in col_s or "close" in col_s.lower():
                         rename_dict[col] = f"{key}_rg_close"
-                    elif "开" in col or "open" in col.lower():
+                    elif "开" in col_s or "open" in col_s.lower():
                         rename_dict[col] = f"{key}_rg_open"
-                    elif "高" in col or "high" in col.lower():
+                    elif "高" in col_s or "high" in col_s.lower():
                         rename_dict[col] = f"{key}_rg_high"
-                    elif "低" in col or "low" in col.lower():
+                    elif "低" in col_s or "low" in col_s.lower():
                         rename_dict[col] = f"{key}_rg_low"
-                elif "cyan_magenta" in col:
-                    if "关" in col or "close" in col.lower():
+                elif "cyan_magenta" in col_s:
+                    if "关" in col_s or "close" in col_s.lower():
                         rename_dict[col] = f"{key}_cm_close"
-                    elif "开" in col or "open" in col.lower():
+                    elif "开" in col_s or "open" in col_s.lower():
                         rename_dict[col] = f"{key}_cm_open"
+                elif "WT1" in col_s and "WT1 — 快线信号" not in df.columns:
+                    rename_dict[col] = "WT1 — 快线信号"
+                elif "WT2" in col_s and "WT2 — 慢线确认" not in df.columns:
+                    rename_dict[col] = "WT2 — 慢线确认"
 
             df = df.rename(columns=rename_dict)
             dfs[key] = df
@@ -136,9 +276,19 @@ class MultiChartDataManager:
 
         # 以最高灵敏度的时间序列 (Renko 0.09%) 作为基底进行对齐
         base_key = "renko_009" if "renko_009" in dfs else list(dfs.keys())[0]
-        base = dfs[base_key][
-            ["epoch", "dt", "open", "high", "low", "close", f"{base_key}_rg_close", f"{base_key}_cm_close"]
-        ].copy()
+        base_cols = ["epoch", "dt"]
+        for c in ["open", "high", "low", "close", f"{base_key}_rg_close", f"{base_key}_cm_close"]:
+            if c in dfs[base_key].columns:
+                base_cols.append(c)
+
+        base = dfs[base_key][base_cols].copy()
+        if "close" in base.columns:
+            if "high" not in base.columns:
+                base["high"] = base["close"]
+            if "low" not in base.columns:
+                base["low"] = base["close"]
+            if "open" not in base.columns:
+                base["open"] = base["close"]
 
         # 添加 Renko 特有指标
         for extra_col in ["需求强度 %", "供给强度 %", "成交量压力 %", "趋势力度 %", "通道位置"]:
@@ -161,7 +311,7 @@ class MultiChartDataManager:
                         if c in other_df.columns:
                             merge_cols.append(c)
                 elif key == "range_4r":
-                    for c in ["买入形状", "卖出形状", "多头反转形状", "空头反转形状", "支撑", "阻力"]:
+                    for c in ["买入形状", "卖出形状", "多头反转形状", "空头反转形状", "快速 MA", "慢速 MA", "支撑", "阻力"]:
                         if c in other_df.columns:
                             merge_cols.append(c)
                 elif key == "10m":
@@ -169,13 +319,16 @@ class MultiChartDataManager:
                         if c in other_df.columns:
                             merge_cols.append(c)
 
-                sub_other = other_df[merge_cols].sort_values("epoch")
+                sub_other = other_df[merge_cols].dropna(subset=["epoch"]).sort_values("epoch")
                 base = pd.merge_asof(base, sub_other, on="epoch", direction="backward")
 
         # 计算速度与差分
         for rg_col in ["10m_rg_close", "4m_01688_rg_close", "renko_009_rg_close", "range_4r_rg_close"]:
             if rg_col in base.columns:
                 base[f"{rg_col}_d1"] = base[rg_col].diff()
+
+        if "renko_009_rg_close" in base.columns:
+            base["renko_min_past5"] = base["renko_009_rg_close"].rolling(6, min_periods=1).min()
 
         # 计算微观金叉死叉
         if "renko_009_rg_close" in base.columns and "renko_009_cm_close" in base.columns:
@@ -234,39 +387,36 @@ class MultiChartAlgorithm:
 
     def evaluate_signals(self, params: Optional[dict] = None) -> pd.DataFrame:
         """对整张时序数据评估买入和卖出信号。"""
-        if params is None:
-            params = self.get_default_parameters()
-
+        p = {**self.get_default_parameters(), **(params or {})}
         df = self.df.copy()
         
-        # 1. 滚动微观极值窗口（过去5根柱内曾触及超卖/超买）
-        df["renko_min_past5"] = df["renko_009_rg_close"].rolling(6, min_periods=1).min()
-        df["renko_max_past5"] = df["renko_009_rg_close"].rolling(6, min_periods=1).max()
+        # 1. 滚动微观极值窗口
+        if "renko_009_rg_close" in df.columns:
+            renko_min = df["renko_min_past5"] if "renko_min_past5" in df.columns else df["renko_009_rg_close"].rolling(6, min_periods=1).min()
+            cond_renko_oversold = (df["renko_009_rg_close"] <= p["buy_renko_rg_max"]) | (
+                renko_min <= 15.0
+            )
+            d1 = df.get("renko_009_rg_close_d1", pd.Series(0, index=df.index))
+            cond_renko_trigger = (d1 > 0) | df.get("renko_cross_up", False)
+        else:
+            cond_renko_oversold = True
+            cond_renko_trigger = True
 
         # 2. 买入条件合成
-        # 宏观基底：10m 处于中低位，4m 处于超跌吸筹位
-        cond_10m_buy = df["10m_rg_close"] <= params["buy_10m_rg_max"]
-        cond_4m_buy = df["4m_01688_rg_close"] <= params["buy_4m_rg_max"]
-        
-        # 微观探底：Renko 触及极值区
-        cond_renko_oversold = (df["renko_009_rg_close"] <= params["buy_renko_rg_max"]) | (
-            df["renko_min_past5"] <= 15.0
-        )
-        
-        # 微观拐头扳机：启动前第一拐
-        cond_renko_trigger = (df["renko_009_rg_close_d1"] > 0) | df.get("renko_cross_up", False)
-        
-        # Range 4R 确认（若缺失则跳过）
+        cond_10m_buy = (df["10m_rg_close"] <= p["buy_10m_rg_max"]) if "10m_rg_close" in df.columns else True
+        cond_4m_buy = (df["4m_01688_rg_close"] <= p["buy_4m_rg_max"]) if "4m_01688_rg_close" in df.columns else True
+
+        # Range 确认（若缺失则跳过）
         if "range_4r_rg_close" in df.columns:
             cond_range_buy = (df["range_4r_rg_close"].isna()) | (
-                df["range_4r_rg_close"] <= params["buy_range_rg_max"]
+                df["range_4r_rg_close"] <= p["buy_range_rg_max"]
             ) | (df.get("range_4r_rg_close_d1", 0) > 0)
         else:
             cond_range_buy = True
 
         # WT1 辅助过滤
         if "WT1 — 快线信号" in df.columns:
-            cond_wt_buy = (df["WT1 — 快线信号"].isna()) | (df["WT1 — 快线信号"] <= params["buy_wt1_max"])
+            cond_wt_buy = (df["WT1 — 快线信号"].isna()) | (df["WT1 — 快线信号"] <= p["buy_wt1_max"])
         else:
             cond_wt_buy = True
 
@@ -280,22 +430,24 @@ class MultiChartAlgorithm:
         )
 
         # 3. 卖出条件合成
-        # 顶背离或极值超买冲顶：Renko 或 Range 4R 冲上 80~95
-        cond_renko_top = (df["renko_009_rg_close"] >= params["sell_renko_rg_min"]) & (
-            (df["renko_009_rg_close_d1"] < 0) | df.get("renko_cross_dn", False)
-        )
-        
+        if "renko_009_rg_close" in df.columns:
+            d1 = df.get("renko_009_rg_close_d1", pd.Series(0, index=df.index))
+            cond_renko_top = (df["renko_009_rg_close"] >= p["sell_renko_rg_min"]) & (
+                (d1 < 0) | df.get("renko_cross_dn", False)
+            )
+            cond_death_cross_top = df.get("renko_cross_dn", False) & (df["renko_009_rg_close"] >= 65.0)
+        else:
+            cond_renko_top = False
+            cond_death_cross_top = False
+
         if "range_4r_rg_close" in df.columns:
             cond_range_top = (
                 df["range_4r_rg_close"].notna()
-                & (df["range_4r_rg_close"] >= params["sell_range_rg_min"])
+                & (df["range_4r_rg_close"] >= p["sell_range_rg_min"])
                 & (df.get("range_4r_rg_close_d1", 0) < 0)
             )
         else:
             cond_range_top = False
-
-        # 高位死叉保护
-        cond_death_cross_top = df.get("renko_cross_dn", False) & (df["renko_009_rg_close"] >= 65.0)
 
         df["raw_sell"] = cond_renko_top | cond_range_top | cond_death_cross_top
 
@@ -303,8 +455,27 @@ class MultiChartAlgorithm:
 
     def run_backtest(self, params: Optional[dict] = None) -> Tuple[pd.DataFrame, dict]:
         """运行无未来函数的动态状态机回测。"""
-        df_sig = self.evaluate_signals(params)
-        stop_loss_pct = (params or self.get_default_parameters())["stop_loss_pct"]
+        p = {**self.get_default_parameters(), **(params or {})}
+        df_sig = self.evaluate_signals(p)
+        stop_loss_pct = p.get("stop_loss_pct", 1.2)
+
+        n = len(df_sig)
+        if n == 0 or "close" not in df_sig.columns:
+            summary = {
+                "total_trades": 0, "win_count": 0, "loss_count": 0,
+                "win_rate_%": 0.0, "cumulative_pnl_%": 0.0, "profit_factor": 0.0,
+                "avg_win_%": 0.0, "avg_loss_%": 0.0, "avg_mfe_%": 0.0, "avg_mae_%": 0.0,
+                "profit_risk_ratio": 0.0
+            }
+            return pd.DataFrame(), summary
+
+        # 极致向量化加速：提取 numpy 1D 数组
+        raw_buy = df_sig["raw_buy"].to_numpy(dtype=bool)
+        raw_sell = df_sig["raw_sell"].to_numpy(dtype=bool)
+        close = df_sig["close"].to_numpy(dtype=float)
+        high = df_sig["high"].to_numpy(dtype=float) if "high" in df_sig.columns else close
+        low = df_sig["low"].to_numpy(dtype=float) if "low" in df_sig.columns else close
+        dt = df_sig["dt"].to_numpy()
 
         trades = []
         position = 0
@@ -314,39 +485,37 @@ class MultiChartAlgorithm:
         peak_price = 0.0
         trough_price = 1e9
 
-        for i in range(len(df_sig)):
-            row = df_sig.iloc[i]
-
+        for i in range(n):
             if position == 0:
-                if row["raw_buy"]:
+                if raw_buy[i]:
                     position = 1
-                    entry_price = row["close"]
-                    entry_time = row["dt"]
+                    entry_price = close[i]
+                    entry_time = dt[i]
                     entry_idx = i
-                    peak_price = row["high"]
-                    trough_price = row["low"]
+                    peak_price = high[i]
+                    trough_price = low[i]
             elif position == 1:
-                if row["high"] > peak_price:
-                    peak_price = row["high"]
-                if row["low"] < trough_price:
-                    trough_price = row["low"]
+                if high[i] > peak_price:
+                    peak_price = high[i]
+                if low[i] < trough_price:
+                    trough_price = low[i]
 
                 # 止损检测
-                current_pnl = (row["close"] - entry_price) / entry_price * 100
+                current_pnl = (close[i] - entry_price) / entry_price * 100.0
                 is_stop_loss = current_pnl <= -stop_loss_pct
 
-                if row["raw_sell"] or is_stop_loss:
-                    exit_price = row["close"]
-                    pnl_pct = (exit_price - entry_price) / entry_price * 100
-                    mfe_pct = (peak_price - entry_price) / entry_price * 100
-                    mae_pct = (entry_price - trough_price) / entry_price * 100
+                if raw_sell[i] or is_stop_loss:
+                    exit_price = close[i]
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100.0
+                    mfe_pct = (peak_price - entry_price) / entry_price * 100.0
+                    mae_pct = (entry_price - trough_price) / entry_price * 100.0
 
                     trades.append({
                         "entry_time": entry_time,
-                        "exit_time": row["dt"],
-                        "bars_held": i - entry_idx,
-                        "entry_price": entry_price,
-                        "exit_price": exit_price,
+                        "exit_time": dt[i],
+                        "bars_held": int(i - entry_idx),
+                        "entry_price": float(entry_price),
+                        "exit_price": float(exit_price),
                         "pnl_pct": round(pnl_pct, 2),
                         "mfe_pct": round(mfe_pct, 2),
                         "mae_pct": round(mae_pct, 2),
@@ -361,7 +530,7 @@ class MultiChartAlgorithm:
             total_pnl = df_trades["pnl_pct"].sum()
             win_count = (df_trades["pnl_pct"] > 0).sum()
             loss_count = (df_trades["pnl_pct"] <= 0).sum()
-            win_rate = (win_count / len(df_trades)) * 100
+            win_rate = (win_count / len(df_trades)) * 100.0
             wins = df_trades[df_trades["pnl_pct"] > 0]["pnl_pct"]
             losses = df_trades[df_trades["pnl_pct"] <= 0]["pnl_pct"]
             avg_win = wins.mean() if len(wins) > 0 else 0.0
